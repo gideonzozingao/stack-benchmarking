@@ -1,0 +1,9 @@
+fib                   9227465
+mandelbrot              96625
+collatz             410011449
+matrix              131400000
+sieve                  348513
+objects          500999500000
+mergesort       2145000386538
+hashmap             250000000
+bintrees              8711918

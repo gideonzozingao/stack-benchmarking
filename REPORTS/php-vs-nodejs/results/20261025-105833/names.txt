@@ -1,0 +1,5 @@
+node
+php
+php+opcache
+php+jit-tracing
+php+jit-function

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# PHP 8.4 vs Node 22 benchmark harness.
+# Run from the folder containing bench.js and bench.php:   ./bench.sh
+# Always runs under bash (shebang), so the zsh ${=JIT} word-splitting problem cannot occur.
+#
+# Tunables (environment variables):
+#   PRESET=heavy      benchmark preset for timing (default: heavy, to reduce startup noise)
+#   RUNS=10           timed runs per command (hyperfine)
+#   WARMUP=2          untimed warmup runs per command
+#   MEMRUNS=3         runs per command for the peak-memory pass
+#   CPUS=2,3          pin every command to these cores with taskset (default: no pinning)
+#   NODE_FILE / PHP_FILE   paths to bench.js / bench.php
+set -euo pipefail
+
+PRESET=${PRESET:-heavy}
+CHECK_PRESET=${CHECK_PRESET:-default}
+RUNS=${RUNS:-10}
+WARMUP=${WARMUP:-2}
+MEMRUNS=${MEMRUNS:-3}
+CPUS=${CPUS:-}
+NODE_FILE=${NODE_FILE:-bench.js}
+PHP_FILE=${PHP_FILE:-bench.php}
+OUT=${OUT:-results/$(date +%Y%m%d-%H%M%S)}
+BENCHES=(fib mandelbrot collatz matrix sieve objects mergesort hashmap bintrees)
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# ---- configurations (parallel arrays, index 0 is the baseline) -------------------------
+PHPF_BARE="-n -d zend.assertions=-1"
+PHPF_OPC="$PHPF_BARE -d zend_extension=opcache -d opcache.enable_cli=1 -d opcache.jit_buffer_size=128M"
+NAMES=("node" "php" "php+opcache" "php+jit-tracing" "php+jit-function")
+PHPFLAGS=("" "$PHPF_BARE" "$PHPF_OPC -d opcache.jit=off" "$PHPF_OPC -d opcache.jit=tracing" "$PHPF_OPC -d opcache.jit=function")
+RUNCMD=("node $NODE_FILE"
+        "php $PHPF_BARE $PHP_FILE"
+        "php $PHPF_OPC -d opcache.jit=off $PHP_FILE"
+        "php $PHPF_OPC -d opcache.jit=tracing $PHP_FILE"
+        "php $PHPF_OPC -d opcache.jit=function $PHP_FILE")
+EXPECT_JIT=("" "no-opcache" "off" "on" "on")
+JITCHK='echo function_exists("opcache_get_status") ? ((opcache_get_status(false)["jit"]["on"] ?? false) ? "on" : "off") : "no-opcache";'
+
+PREFIX=""
+[ -n "$CPUS" ] && PREFIX="taskset -c $CPUS "
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1'. $2"; }
+
+# hyperfine >= 1.15 can skip the intermediate shell (-N); older versions (e.g. 1.12) cannot.
+# Without -N, hyperfine measures and subtracts the shell start-up cost itself, which is fine for
+# multi-second benchmarks but makes the ~40 ms startup baseline less precise.
+HF_NOSHELL=0
+HF_HELP=$(hyperfine --help 2>&1 || true)
+if grep -qE '(^|[[:space:]])-N([[:space:],]|$)' <<< "$HF_HELP"; then HF_NOSHELL=1; fi
+hf() { if [ "$HF_NOSHELL" = 1 ]; then hyperfine -N "$@"; else hyperfine "$@"; fi; }
+
+# ---- 1. preflight ----------------------------------------------------------------------
+need node "Install Node 22."
+need php "Install PHP 8.4."
+need hyperfine "Install it: apt install hyperfine (or: cargo install hyperfine)."
+need python3 "Needed for the summary step."
+[ -x /usr/bin/time ] || die "missing /usr/bin/time (GNU time). Install the 'time' package."
+[ -f "$NODE_FILE" ] || die "$NODE_FILE not found (run from the benchmark folder or set NODE_FILE)."
+[ -f "$PHP_FILE" ]  || die "$PHP_FILE not found (run from the benchmark folder or set PHP_FILE)."
+[ -n "$CPUS" ] && need taskset "Install util-linux or unset CPUS."
+
+mkdir -p "$OUT"
+printf '%s\n' "${NAMES[@]}" > "$OUT/names.txt"
+printf '%s\n' "${BENCHES[@]}" > "$OUT/benches.txt"
+
+echo "== Environment =="
+{
+  echo "date:      $(date -Is)"
+  echo "kernel:    $(uname -a)"
+  echo "cpu:       $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')"
+  echo "cores:     $(nproc)"
+  echo "governor:  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+  echo "loadavg:   $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo n/a)"
+  echo "wsl/vm:    $(grep -qi microsoft /proc/version 2>/dev/null && echo 'WSL detected' || echo 'no WSL marker')"
+  echo "node:      $(node -v)"
+  echo "php:       $(php -n -v | head -1)"
+  echo "hyperfine: $(hyperfine --version) (no-shell mode: $([ "$HF_NOSHELL" = 1 ] && echo yes || echo 'no, upgrade to >=1.15 for tighter startup numbers'))"
+  echo "preset:    $PRESET  runs=$RUNS warmup=$WARMUP memruns=$MEMRUNS  pin=${CPUS:-none}"
+} | tee "$OUT/env.txt"
+
+echo; echo "== Preflight: JIT state per configuration =="
+for i in "${!NAMES[@]}"; do
+  [ "$i" -eq 0 ] && continue
+  # shellcheck disable=SC2086
+  got=$(php ${PHPFLAGS[$i]} -r "$JITCHK")
+  printf '%-18s expected=%-10s got=%s\n' "${NAMES[$i]}" "${EXPECT_JIT[$i]}" "$got"
+  [ "$got" = "${EXPECT_JIT[$i]}" ] || die "${NAMES[$i]}: JIT state is '$got', expected '${EXPECT_JIT[$i]}'. Fix before timing."
+done
+
+echo; echo "== Preflight: checksums (preset=$CHECK_PRESET) =="
+node "$NODE_FILE" "$CHECK_PRESET" | tail -n +2 > "$OUT/checksums.node.txt"
+for i in "${!NAMES[@]}"; do
+  [ "$i" -eq 0 ] && continue
+  # shellcheck disable=SC2086
+  php ${PHPFLAGS[$i]} "$PHP_FILE" "$CHECK_PRESET" | tail -n +2 > "$OUT/checksums.${NAMES[$i]}.txt"
+  if diff -q "$OUT/checksums.node.txt" "$OUT/checksums.${NAMES[$i]}.txt" >/dev/null; then
+    echo "${NAMES[$i]}: MATCH"
+  else
+    diff "$OUT/checksums.node.txt" "$OUT/checksums.${NAMES[$i]}.txt" || true
+    die "${NAMES[$i]}: checksum mismatch. A mismatch means a bug (or a JIT miscompile); timings would be meaningless."
+  fi
+done
+
+# ---- 2. startup baseline ---------------------------------------------------------------
+echo; echo "== Startup baseline (empty program) =="
+sargs=()
+for i in "${!NAMES[@]}"; do
+  if [ "$i" -eq 0 ]; then c="${PREFIX}node -e 0"; else c="${PREFIX}php ${PHPFLAGS[$i]} -r '0;'"; fi
+  sargs+=(-n "${NAMES[$i]}" "$c")
+done
+hf --warmup 5 --runs 30 --export-json "$OUT/startup.json" "${sargs[@]}" >/dev/null
+echo "saved $OUT/startup.json"
+
+# ---- 3. timing: monotonic clock (hyperfine), all configs per benchmark -----------------
+echo; echo "== Timing (preset=$PRESET) =="
+for b in "${BENCHES[@]}"; do
+  echo "-- $b"
+  targs=()
+  for i in "${!NAMES[@]}"; do
+    targs+=(-n "${NAMES[$i]}" "${PREFIX}${RUNCMD[$i]} $PRESET $b")
+  done
+  hf --warmup "$WARMUP" --runs "$RUNS" --export-json "$OUT/time-$b.json" "${targs[@]}" >/dev/null
+done
+
+# ---- 4. peak memory (separate pass; the timing pass is not affected by it) -------------
+echo; echo "== Peak memory (max RSS, KB) =="
+echo "bench,name,kb" > "$OUT/mem.csv"
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+for b in "${BENCHES[@]}"; do
+  for i in "${!NAMES[@]}"; do
+    read -ra parts <<< "${PREFIX}${RUNCMD[$i]} $PRESET $b"
+    for _ in $(seq "$MEMRUNS"); do
+      /usr/bin/time -f "%M" -o "$tmp" "${parts[@]}" >/dev/null
+      echo "$b,${NAMES[$i]},$(tail -1 "$tmp")" >> "$OUT/mem.csv"
+    done
+  done
+  echo "-- $b done"
+done
+
+# ---- 5. summary ------------------------------------------------------------------------
+echo
+python3 "$HERE/summarize.py" "$OUT"
+echo; echo "Results in: $OUT   (open $OUT/results.md)"

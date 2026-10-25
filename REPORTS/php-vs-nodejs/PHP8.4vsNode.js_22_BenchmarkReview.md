@@ -146,4 +146,7 @@ opcache.jit_buffer_size=128M
 
 ## 8. Conclusion
 
-On this suite, tuned PHP 8.4 (OPcache + JIT, no debugger extensions) is on par with Node 22 overall. Untuned PHP is 2–4x slower on compute and PHP with Xdebug loaded is an order of magnitude slower. Neither runtime is a safe general "winner": Node leads on numeric loops and GC-heavy allocation, and PHP leads on hash-map work. For typical I/O-bound business applications the gap is unlikely to decide anything. Fix the environment first, then re-measure with the improved methodology above before making a platform decision on performance grounds.
+On this suite, tuned PHP 8.4 (OPcache + JIT, no debugger extensions) is on par with Node 22 overall. Untuned PHP is 2–4x slower on compute and PHP with Xdebug loaded is an order of magnitude slower. Neither runtime is a safe general "winner": Node leads on numeric loops and GC-heavy allocation, and PHP leads on hash-map work. For typical I/O-bound business applications the gap is unlikely to decide anything.
+#TO-D
+   - Fix the environment first, then
+   - re-measure with the improved methodology above before making a platform decision on performance grounds.
